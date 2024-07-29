@@ -1,0 +1,260 @@
+ program.py:
+
+```python
+import os
+from datetime import datetime, timedelta
+import pdfplumber
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import configparser
+import sys
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class ReportProcessor:
+    def __init__(self, config_file_path):
+        self.config = self.load_configurations(config_file_path)
+        self.counters = {
+            "total_files": 0, "read_files": 0, "tc_reports": 0, 
+            "deli_reports": 0, "qsr_reports": 0, "date_failures": 0, 
+            "date_successes": 0, "quality_failures": 0
+        }
+        self.error_messages = []
+        self.date_failure_details = []
+
+    def load_configurations(self, config_file_path):
+        config = configparser.ConfigParser()
+        config.read(os.path.join(config_file_path, 'thirteen_weeker_qc_config.ini'))
+        return {
+            "email_sender": config['Email']['Sender'],
+            "email_recipient": config.get('Email', 'Recipient').split(','),
+            "email_subject": config['Email']['Subject'],
+            "smtp_server": config['Email']['SMTPServer'],
+            "smtp_port": int(config['Email']['SMTPPort']),
+            "pdf_directory": config['PDFSource']['PDFDirectory'],
+            "pdf_backup_directory": config['PDFBackupSource']['PDFBackupDirectory'],
+            "tc_13_weeker_table_settings": eval(config['PDF_table_settings']['tc_13_weeker_table_settings']),
+            "deli_13_weeker_table_settings": eval(config['PDF_table_settings']['deli_13_weeker_table_settings']),
+            "qsr_13_weeker_table_settings": eval(config['PDF_table_settings']['qsr_13_weeker_table_settings'])
+        }
+
+    def calculate_expected_date(self):
+        current_date = datetime.now()
+        current_weekday = current_date.weekday()
+        if current_weekday <= 2:  # If it's Monday, Tuesday, or Wednesday
+            days_to_last_wednesday = current_weekday + 5
+            return (current_date - timedelta(days=days_to_last_wednesday)).strftime("%m/%d")
+        else:  # If it's Thursday, Friday, Saturday, or Sunday
+            days_to_this_wednesday = current_weekday - 2
+            return (current_date + timedelta(days=days_to_this_wednesday)).strftime("%m/%d")
+
+    def calculate_last_friday_date(self):
+        current_date = datetime.now()
+        current_weekday = current_date.weekday()
+        days_since_last_friday = current_weekday + 3 if current_weekday >= 5 else current_weekday + 3
+        last_friday_date = current_date - timedelta(days=days_since_last_friday)
+        return last_friday_date.strftime("%Y%m%d")
+
+    def send_email(self, email_content):
+        msg = MIMEMultipart()
+        msg['From'] = self.config['email_sender']
+        msg['To'] = ', '.join(self.config['email_recipient'])
+        msg['Subject'] = self.config['email_subject']
+        msg.attach(MIMEText(email_content, 'html'))
+        
+        with smtplib.SMTP(self.config['smtp_server'], self.config['smtp_port']) as server:
+            server.sendmail(self.config['email_sender'], self.config['email_recipient'], msg.as_string())
+
+    def prepare_email_content(self):
+        # ... (keep the existing prepare_email_content method)
+
+    def read_pdf_and_filter_data_last_week(self, filename, report_type):
+        last_friday_date_str = self.calculate_last_friday_date()
+        backup_dir = self.config['pdf_backup_directory']
+        
+        # Find the latest backup directory
+        directories = [d for d in os.listdir(backup_dir) if os.path.isdir(os.path.join(backup_dir, d)) and d.startswith(last_friday_date_str)]
+        latest_directory = max(directories) if directories else None
+        
+        if not latest_directory:
+            logging.warning(f"No backup directory found for date: {last_friday_date_str}")
+            return None, None
+
+        file_path = os.path.join(backup_dir, latest_directory, filename)
+        return self.read_pdf_and_filter_data(file_path, report_type, is_backup=True)
+
+    def read_pdf_and_filter_data(self, file_path, report_type, is_backup=False):
+        filtered_data = {}
+        all_tables = []
+        actual_date_found = None
+
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                for page in pdf.pages:
+                    table = page.extract_table(self.config[f"{report_type}_13_weeker_table_settings"])
+                    if table:
+                        all_tables.extend(table)
+
+            data_dict = {row[0]: row[1:] for row in all_tables}
+            keys_to_keep = self.get_keys_to_keep(report_type)
+
+            for key in keys_to_keep:
+                if key in data_dict:
+                    filtered_data[key] = data_dict[key]
+
+            actual_date_found = filtered_data.get("Metric", [None])[0]
+            
+            if not is_backup:
+                expected_date = self.calculate_expected_date()
+                date_match = actual_date_found == expected_date
+                return filtered_data, date_match, actual_date_found
+            
+            return filtered_data, actual_date_found
+
+        except Exception as e:
+            logging.error(f"Error reading {file_path}: {e}")
+            return None, None if is_backup else None, None, None
+
+    def get_keys_to_keep(self, report_type):
+        keys_map = {
+            "tc": ["Metric", "Restaurant Actuals $", "QSR Sales Total $", "Total Inside Sales $", "TC Lbr Dol Actual"],
+            "deli": ["Metric", "Deli Total Sales $", "Deli Lbr% of Sls Act"],
+            "qsr": ["Metric", "Total Payroll $", "Net Sales $"]
+        }
+        return keys_map.get(report_type, [])
+
+    def quality_checks(self, report_type, filtered_data, filename):
+        error_messages = []
+        backup_filtered_data, _ = self.read_pdf_and_filter_data_last_week(filename, report_type)
+        
+        if not backup_filtered_data:
+            logging.warning(f"No backup data found for {filename}")
+            return error_messages
+
+        keys_to_check = self.get_keys_to_keep(report_type)[1:]  # Exclude "Metric"
+
+        for key in keys_to_check:
+            current_week_data = filtered_data.get(key, [None])[0]
+            last_week_data = backup_filtered_data.get(key, [None])[0]
+            
+            if last_week_data and not current_week_data:
+                error_messages.append(f"<tr><td>{filename}</td><td>{key}</td><td>Missing</td><td>Available</td></tr>")
+
+        return error_messages
+
+    def process_reports(self):
+        for filename in os.listdir(self.config['pdf_directory']):
+            if filename.endswith(".pdf"):
+                self.counters["total_files"] += 1
+                file_path = os.path.join(self.config['pdf_directory'], filename)
+                
+                if (datetime.now() - datetime.fromtimestamp(os.path.getmtime(file_path))).days >= 30:
+                    continue
+
+                report_type = self.get_report_type(filename)
+                if not report_type:
+                    continue
+
+                self.counters[f"{report_type}_reports"] += 1
+                self.counters["read_files"] += 1
+
+                filtered_data, date_check, actual_date_found = self.read_pdf_and_filter_data(file_path, report_type)
+                
+                if date_check:
+                    self.counters["date_successes"] += 1
+                else:
+                    self.counters["date_failures"] += 1
+                    self.date_failure_details.append((filename, self.calculate_expected_date(), actual_date_found))
+
+                qc_errors = self.quality_checks(report_type, filtered_data, filename)
+                if qc_errors:
+                    self.error_messages.extend(qc_errors)
+                    self.counters["quality_failures"] += len(qc_errors)
+
+    def get_report_type(self, filename):
+        if "13 Weeker (Financial Section).pdf" in filename:
+            return "tc"
+        elif " Deli 13 Week PFJ.pdf" in filename:
+            return "deli"
+        elif " 13 Weeker - QSR.pdf" in filename:
+            return "qsr"
+        return None
+
+    def run(self):
+        self.process_reports()
+        email_content = self.prepare_email_content()
+        
+        # Update email subject based on errors
+        if self.counters['date_failures'] > 0 and self.counters['quality_failures'] > 0:
+            self.config['email_subject'] += ' - Date and Quality check errors found'
+        elif self.counters['date_failures'] > 0:
+            self.config['email_subject'] += ' - Date check errors found'
+        elif self.counters['quality_failures'] > 0:
+            self.config['email_subject'] += ' - Quality check errors found'
+        else:
+            self.config['email_subject'] += ' - Quality Check Successful'
+
+        self.send_email(email_content)
+
+        if self.counters['date_failures'] > 0 or self.counters['quality_failures'] > 0:
+            logging.warning("Date/Quality check Errors found in the reports. Please check the email sent for more details.")
+            return 1
+        else:
+            logging.info("Quality Check Successful. No errors found in the reports.")
+            return 0
+
+def main():
+    if len(sys.argv) != 2:
+        logging.error(f"Usage: python thirteen_weeker_qc.py <config_file_directory>")
+        sys.exit(1)
+    
+    config_file_path = sys.argv[1]
+    processor = ReportProcessor(config_file_path)
+    sys.exit(processor.run())
+
+if __name__ == "__main__":
+    main()
+```
+
+config.ini:
+
+```ini
+[Email]
+Sender = Tableau@pilotcorp.net
+Recipient = Marsha.Mundale@test.com
+Subject = Local Test Thirteen Weeker PDF Quality Check Report
+SMTPServer = pilotrelay.pilotcorp.net
+SMTPPort = 25
+
+[PDFSource]
+PDFDirectory = C:\Users\TW
+
+[PDFBackupSource]
+PDFBackupDirectory = C:\Users\Report_backup
+
+[PDF_table_settings]
+tc_13_weeker_table_settings = {
+    "vertical_strategy": "explicit",
+    "horizontal_strategy": "explicit",
+    "explicit_vertical_lines": [35, 124, 172, 220, 268, 316, 364, 412, 460, 508, 556, 604, 652, 700, 748],
+    "explicit_horizontal_lines": [77, 97, 117, 137, 157, 177, 197, 220, 242, 262, 282, 302, 325, 345, 365, 385, 410, 430, 450, 470, 495, 515, 535, 555]
+}
+
+deli_13_weeker_table_settings = {
+    "vertical_strategy": "explicit",
+    "horizontal_strategy": "explicit",
+    "explicit_vertical_lines": [96, 162, 206, 251, 296, 341, 386, 431, 476, 521, 566, 611, 656, 705, 750],
+    "explicit_horizontal_lines": [77, 93, 108, 123, 140, 158, 176, 190, 210, 225, 245, 258, 277, 290, 310, 325, 345, 360, 380, 392, 412, 425, 445, 460, 480, 495, 515, 530, 545, 562]
+}
+
+qsr_13_weeker_table_settings = {
+    "vertical_strategy": "explicit",
+    "horizontal_strategy": "explicit",
+    "explicit_vertical_lines": [35, 110, 155, 200, 245, 290, 335, 385, 430, 475, 520, 565, 615, 660, 705, 750],
+    "explicit_horizontal_lines": [85, 105, 120, 139, 159, 177, 197, 210, 230, 255, 275, 295, 315, 335, 355, 375, 395, 415, 435, 452, 472, 492, 512, 530, 550, 570]
+}
+```
+
