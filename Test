@@ -349,3 +349,107 @@ These changes make the code much more configurable and adaptable:
 To adapt this script for other PDF quality checks:
 
 1. Update the `report_settings` in the configuration file to include the new report types
+
+
+
+--------
+
+
+[Email]
+Sender = Tableau@pilotcorp.net
+Recipient = Marsha.Mundale@pilottravelcenters.com
+Subject = PDF Quality Check Report
+SMTPServer = pilotrelay.pilotcorp.net
+SMTPPort = 25
+
+[Directories]
+PDFDirectory = C:\Users\531173\OneDrive - PILOT TRAVEL CENTERS LLC\Documents\ThirteenWeeker
+PDFBackupDirectory = C:\Users\531173\OneDrive - PILOT TRAVEL CENTERS LLC\Documents\ThirteenWeeker\Report_backup
+
+[General]
+DateFormat = %%m/%%d
+MaxFileAgeDays = 30
+
+[ReportTypes]
+Types = tc,deli,qsr
+
+[TC]
+FilePattern = 13 Weeker (Financial Section).pdf
+TableSettings = {"vertical_strategy": "explicit", "horizontal_strategy": "explicit", "explicit_vertical_lines": [35, 124, 172, 220, 268, 316, 364, 412, 460, 508, 556, 604, 652, 700, 748], "explicit_horizontal_lines": [77, 97, 117, 137, 157, 177, 197, 220, 242, 262, 282, 302, 325, 345, 365, 385, 410, 430, 450, 470, 495, 515, 535, 555]}
+KeysToKeep = Metric,Restaurant Actuals $,QSR Sales Total $,Total Inside Sales $,TC Lbr Dol Actual
+KeysToCheck = Restaurant Actuals $,QSR Sales Total $,Total Inside Sales $,TC Lbr Dol Actual
+DateKey = Metric
+
+[Deli]
+FilePattern = Deli 13 Week PFJ.pdf
+TableSettings = {"vertical_strategy": "explicit", "horizontal_strategy": "explicit", "explicit_vertical_lines": [96, 162, 206, 251, 296, 341, 386, 431, 476, 521, 566, 611, 656, 705, 750], "explicit_horizontal_lines": [77, 93, 108, 123, 140, 158, 176, 190, 210, 225, 245, 258, 277, 290, 310, 325, 345, 360, 380, 392, 412, 425, 445, 460, 480, 495, 515, 530, 545, 562]}
+KeysToKeep = Metric,Deli Total Sales $,Deli Lbr% of Sls Act
+KeysToCheck = Deli Total Sales $,Deli Lbr% of Sls Act
+DateKey = Metric
+
+[QSR]
+FilePattern = 13 Weeker - QSR.pdf
+TableSettings = {"vertical_strategy": "explicit", "horizontal_strategy": "explicit", "explicit_vertical_lines": [35, 110, 155, 200, 245, 290, 335, 385, 430, 475, 520, 565, 615, 660, 705, 750], "explicit_horizontal_lines": [85, 105, 120, 139, 159, 177, 197, 210, 230, 255, 275, 295, 315, 335, 355, 375, 395, 415, 435, 452, 472, 492, 512, 530, 550, 570]}
+KeysToKeep = Metric,Total Payroll $,Net Sales $
+KeysToCheck = Total Payroll $,Net Sales $
+DateKey = Metric
+
+
+```python
+import json
+
+def load_configurations(config_file_path):
+    """
+    Load configurations from the INI file.
+    
+    Args:
+        config_file_path (str): Path to the configuration file.
+    
+    Returns:
+        dict: Configuration settings.
+    """
+    config = configparser.ConfigParser()
+    config.read(config_file_path)
+    
+    pdf_settings = {}
+    for report_type in config['ReportTypes']['Types'].split(','):
+        pdf_settings[report_type] = {
+            'file_pattern': config[report_type.upper()]['FilePattern'],
+            'table_settings': json.loads(config[report_type.upper()]['TableSettings']),
+            'keys_to_keep': config[report_type.upper()]['KeysToKeep'].split(','),
+            'keys_to_check': config[report_type.upper()]['KeysToCheck'].split(','),
+            'date_key': config[report_type.upper()]['DateKey']
+        }
+    
+    return {
+        "email": {
+            "sender": config.get('Email', 'Sender'),
+            "recipient": config.get('Email', 'Recipient').split(','),
+            "subject": config.get('Email', 'Subject'),
+            "smtp_server": config.get('Email', 'SMTPServer'),
+            "smtp_port": config.getint('Email', 'SMTPPort')
+        },
+        "directories": {
+            "pdf_directory": config.get('Directories', 'PDFDirectory'),
+            "pdf_backup_directory": config.get('Directories', 'PDFBackupDirectory')
+        },
+        "pdf_settings": pdf_settings,
+        "date_format": config.get('General', 'DateFormat'),
+        "max_file_age_days": config.getint('General', 'MaxFileAgeDays')
+    }
+```
+
+This new configuration format and updated `load_configurations` function offer several advantages:
+
+1. It's more compatible with the INI file format, avoiding issues with multi-line JSON.
+2. It's easier to read and modify, with each report type having its own section.
+3. It's still flexible, allowing easy addition of new report types by adding new sections to the config file.
+4. The `TableSettings` for each report type are still in JSON format, but on a single line, which should parse correctly.
+
+To add a new report type, you would:
+
+1. Add the new report type to the `Types` list in the `[ReportTypes]` section.
+2. Create a new section for the report type (e.g., `[NewReport]`).
+3. Fill in the required fields: `FilePattern`, `TableSettings`, `KeysToKeep`, `KeysToCheck`, and `DateKey`.
+
+This structure maintains the flexibility of the previous version while being more compatible with INI file parsing.
