@@ -1,0 +1,351 @@
+``python
+import os
+from datetime import datetime, timedelta
+import pdfplumber
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import configparser
+import sys
+import logging
+import json
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def load_configurations(config_file_path):
+    """
+    Load configurations from the INI file.
+    
+    Args:
+        config_file_path (str): Path to the configuration file.
+    
+    Returns:
+        dict: Configuration settings.
+    """
+    config = configparser.ConfigParser()
+    config.read(config_file_path)
+    
+    # Load and parse JSON strings for complex configurations
+    pdf_settings = json.loads(config.get('PDF_Settings', 'report_settings'))
+    
+    return {
+        "email": {
+            "sender": config.get('Email', 'Sender'),
+            "recipient": config.get('Email', 'Recipient').split(','),
+            "subject": config.get('Email', 'Subject'),
+            "smtp_server": config.get('Email', 'SMTPServer'),
+            "smtp_port": config.getint('Email', 'SMTPPort')
+        },
+        "directories": {
+            "pdf_directory": config.get('Directories', 'PDFDirectory'),
+            "pdf_backup_directory": config.get('Directories', 'PDFBackupDirectory')
+        },
+        "pdf_settings": pdf_settings,
+        "date_format": config.get('General', 'DateFormat'),
+        "max_file_age_days": config.getint('General', 'MaxFileAgeDays')
+    }
+
+def calculate_expected_date(config):
+    """
+    Calculate the expected date for the reports based on the configured format.
+    
+    Args:
+        config (dict): Configuration settings.
+    
+    Returns:
+        str: Expected date string.
+    """
+    current_date = datetime.now()
+    current_weekday = current_date.weekday()
+    
+    # Calculate the date of the most recent Wednesday
+    if current_weekday < 2:  # Monday or Tuesday
+        days_to_subtract = current_weekday + 5
+    else:
+        days_to_subtract = current_weekday - 2
+    
+    expected_date = current_date - timedelta(days=days_to_subtract)
+    return expected_date.strftime(config['date_format'])
+
+def calculate_last_friday_date(config):
+    """
+    Calculate last Friday's date.
+    
+    Args:
+        config (dict): Configuration settings.
+    
+    Returns:
+        str: Last Friday's date string.
+    """
+    current_date = datetime.now()
+    current_weekday = current_date.weekday()
+    days_since_last_friday = (current_weekday + 3) % 7
+    last_friday_date = current_date - timedelta(days=days_since_last_friday)
+    return last_friday_date.strftime(config['date_format'])
+
+def send_email(email_content, config):
+    """
+    Send an HTML email with the report results.
+    
+    Args:
+        email_content (str): HTML content of the email.
+        config (dict): Configuration settings.
+    """
+    msg = MIMEMultipart()
+    msg['From'] = config['email']['sender']
+    msg['To'] = ', '.join(config['email']['recipient'])
+    msg['Subject'] = config['email']['subject']
+    msg.attach(MIMEText(email_content, 'html'))
+    
+    with smtplib.SMTP(config['email']['smtp_server'], config['email']['smtp_port']) as server:
+        server.sendmail(config['email']['sender'], config['email']['recipient'], msg.as_string())
+
+def prepare_email_content(counters, error_messages, date_failure_details):
+    """
+    Prepare the HTML content for the email report.
+    
+    Args:
+        counters (dict): Counters for various statistics.
+        error_messages (list): List of error messages.
+        date_failure_details (list): List of date failure details.
+    
+    Returns:
+        str: HTML content for the email.
+    """
+    # ... (keep the existing prepare_email_content function)
+    # This function should be updated to use the new configuration structure if needed
+
+def read_pdf_and_filter_data(file_path, report_type, config, is_backup=False):
+    """
+    Read PDF, extract data, and filter based on report type.
+    
+    Args:
+        file_path (str): Path to the PDF file.
+        report_type (str): Type of the report.
+        config (dict): Configuration settings.
+        is_backup (bool): Flag to indicate if this is a backup report.
+    
+    Returns:
+        tuple: Filtered data, date check result, and actual date found.
+    """
+    filtered_data = {}
+    all_tables = []
+    actual_date_found = None
+
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                table = page.extract_table(config['pdf_settings'][report_type]['table_settings'])
+                if table:
+                    all_tables.extend(table)
+
+        data_dict = {row[0]: row[1:] for row in all_tables}
+        keys_to_keep = config['pdf_settings'][report_type]['keys_to_keep']
+
+        for key in keys_to_keep:
+            if key in data_dict:
+                filtered_data[key] = data_dict[key]
+
+        actual_date_found = filtered_data.get(config['pdf_settings'][report_type]['date_key'], [None])[0]
+        
+        if not is_backup:
+            expected_date = calculate_expected_date(config)
+            date_match = actual_date_found == expected_date
+            return filtered_data, date_match, actual_date_found
+        
+        return filtered_data, actual_date_found
+
+    except Exception as e:
+        logging.error(f"Error reading {file_path}: {e}")
+        return None, None if is_backup else None, None, None
+
+def quality_checks(report_type, filtered_data, filename, config):
+    """
+    Perform quality checks on the filtered data.
+    
+    Args:
+        report_type (str): Type of the report.
+        filtered_data (dict): Filtered data from the current report.
+        filename (str): Name of the file being processed.
+        config (dict): Configuration settings.
+    
+    Returns:
+        list: List of error messages.
+    """
+    error_messages = []
+    backup_file_path = os.path.join(config['directories']['pdf_backup_directory'], filename)
+    backup_filtered_data, _ = read_pdf_and_filter_data(backup_file_path, report_type, config, is_backup=True)
+    
+    if not backup_filtered_data:
+        logging.warning(f"No backup data found for {filename}")
+        return error_messages
+
+    keys_to_check = config['pdf_settings'][report_type]['keys_to_check']
+
+    for key in keys_to_check:
+        current_week_data = filtered_data.get(key, [None])[0]
+        last_week_data = backup_filtered_data.get(key, [None])[0]
+        
+        if last_week_data and not current_week_data:
+            error_messages.append(f"<tr><td>{filename}</td><td>{key}</td><td>Missing</td><td>Available</td></tr>")
+
+    return error_messages
+
+def process_reports(config):
+    """
+    Process all reports in the specified directory.
+    
+    Args:
+        config (dict): Configuration settings.
+    
+    Returns:
+        tuple: Counters, error messages, and date failure details.
+    """
+    counters = {
+        "total_files": 0,
+        "read_files": 0,
+        "date_failures": 0,
+        "date_successes": 0,
+        "quality_failures": 0
+    }
+    error_messages = []
+    date_failure_details = []
+
+    for filename in os.listdir(config['directories']['pdf_directory']):
+        if filename.endswith(".pdf"):
+            counters["total_files"] += 1
+            file_path = os.path.join(config['directories']['pdf_directory'], filename)
+            
+            if (datetime.now() - datetime.fromtimestamp(os.path.getmtime(file_path))).days >= config['max_file_age_days']:
+                continue
+
+            report_type = next((rt for rt, settings in config['pdf_settings'].items() if settings['file_pattern'] in filename), None)
+            if not report_type:
+                continue
+
+            counters["read_files"] += 1
+
+            filtered_data, date_check, actual_date_found = read_pdf_and_filter_data(file_path, report_type, config)
+            
+            if date_check:
+                counters["date_successes"] += 1
+            else:
+                counters["date_failures"] += 1
+                date_failure_details.append((filename, calculate_expected_date(config), actual_date_found))
+
+            qc_errors = quality_checks(report_type, filtered_data, filename, config)
+            error_messages.extend(qc_errors)
+            counters["quality_failures"] += len(qc_errors)
+
+    return counters, error_messages, date_failure_details
+
+def main():
+    """
+    Main function to run the report processing and send email.
+    """
+    if len(sys.argv) != 2:
+        logging.error(f"Usage: python {sys.argv[0]} <config_file_path>")
+        sys.exit(1)
+    
+    config_file_path = sys.argv[1]
+    config = load_configurations(config_file_path)
+
+    counters, error_messages, date_failure_details = process_reports(config)
+    email_content = prepare_email_content(counters, error_messages, date_failure_details)
+    
+    # Update email subject based on errors
+    if counters['date_failures'] > 0 and counters['quality_failures'] > 0:
+        config['email']['subject'] += ' - Date and Quality check errors found'
+    elif counters['date_failures'] > 0:
+        config['email']['subject'] += ' - Date check errors found'
+    elif counters['quality_failures'] > 0:
+        config['email']['subject'] += ' - Quality check errors found'
+    else:
+        config['email']['subject'] += ' - Quality Check Successful'
+
+    send_email(email_content, config)
+
+    if counters['date_failures'] > 0 or counters['quality_failures'] > 0:
+        logging.warning("Date/Quality check Errors found in the reports. Please check the email sent for more details.")
+        return 1
+    else:
+        logging.info("Quality Check Successful. No errors found in the reports.")
+        return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+Now, let's update the configuration file (thirteen_weeker_qc_config.ini) to make it more flexible and configurable:
+
+```ini
+[Email]
+Sender = Tableau@pilotcorp.net
+Recipient = Marsha.Mundale@pilottravelcenters.com
+Subject = PDF Quality Check Report
+SMTPServer = pilotrelay.pilotcorp.net
+SMTPPort = 25
+
+[Directories]
+PDFDirectory = C:\Users\531173\OneDrive - PILOT TRAVEL CENTERS LLC\Documents\ThirteenWeeker
+PDFBackupDirectory = C:\Users\531173\OneDrive - PILOT TRAVEL CENTERS LLC\Documents\ThirteenWeeker\Report_backup
+
+[General]
+DateFormat = %%m/%%d
+MaxFileAgeDays = 30
+
+[PDF_Settings]
+report_settings = {
+    "tc": {
+        "file_pattern": "13 Weeker (Financial Section).pdf",
+        "table_settings": {
+            "vertical_strategy": "explicit",
+            "horizontal_strategy": "explicit",
+            "explicit_vertical_lines": [35, 124, 172, 220, 268, 316, 364, 412, 460, 508, 556, 604, 652, 700, 748],
+            "explicit_horizontal_lines": [77, 97, 117, 137, 157, 177, 197, 220, 242, 262, 282, 302, 325, 345, 365, 385, 410, 430, 450, 470, 495, 515, 535, 555]
+        },
+        "keys_to_keep": ["Metric", "Restaurant Actuals $", "QSR Sales Total $", "Total Inside Sales $", "TC Lbr Dol Actual"],
+        "keys_to_check": ["Restaurant Actuals $", "QSR Sales Total $", "Total Inside Sales $", "TC Lbr Dol Actual"],
+        "date_key": "Metric"
+    },
+    "deli": {
+        "file_pattern": " Deli 13 Week PFJ.pdf",
+        "table_settings": {
+            "vertical_strategy": "explicit",
+            "horizontal_strategy": "explicit",
+            "explicit_vertical_lines": [96, 162, 206, 251, 296, 341, 386, 431, 476, 521, 566, 611, 656, 705, 750],
+            "explicit_horizontal_lines": [77, 93, 108, 123, 140, 158, 176, 190, 210, 225, 245, 258, 277, 290, 310, 325, 345, 360, 380, 392, 412, 425, 445, 460, 480, 495, 515, 530, 545, 562]
+        },
+        "keys_to_keep": ["Metric", "Deli Total Sales $", "Deli Lbr% of Sls Act"],
+        "keys_to_check": ["Deli Total Sales $", "Deli Lbr% of Sls Act"],
+        "date_key": "Metric"
+    },
+    "qsr": {
+        "file_pattern": " 13 Weeker - QSR.pdf",
+        "table_settings": {
+            "vertical_strategy": "explicit",
+            "horizontal_strategy": "explicit",
+            "explicit_vertical_lines": [35, 110, 155, 200, 245, 290, 335, 385, 430, 475, 520, 565, 615, 660, 705, 750],
+            "explicit_horizontal_lines": [85, 105, 120, 139, 159, 177, 197, 210, 230, 255, 275, 295, 315, 335, 355, 375, 395, 415, 435, 452, 472, 492, 512, 530, 550, 570]
+        },
+        "keys_to_keep": ["Metric", "Total Payroll $", "Net Sales $"],
+        "keys_to_check": ["Total Payroll $", "Net Sales $"],
+        "date_key": "Metric"
+    }
+}
+```
+
+These changes make the code much more configurable and adaptable:
+
+1. The configuration file now uses a JSON structure for PDF settings, allowing easy addition of new report types.
+2. Each report type has its own set of configuration parameters, including file pattern, table settings, keys to keep, keys to check, and the key containing the date.
+3. The main script now reads these configurations and adapts its behavior accordingly.
+4. The date format and maximum file age are now configurable.
+5. The script is now more generic and can handle different types of PDF reports by simply updating the configuration file.
+6. Detailed comments have been added to explain the purpose and functionality of each function.
+7. Error handling and logging have been improved throughout the script.
+
+To adapt this script for other PDF quality checks:
+
+1. Update the `report_settings` in the configuration file to include the new report types
